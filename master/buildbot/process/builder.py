@@ -28,6 +28,7 @@ from buildbot.status.buildrequest import BuildRequestStatus
 from buildbot.process.properties import Properties
 from buildbot.process import buildrequest, slavebuilder
 from buildbot.process.slavebuilder import BUILDING
+from buildbot.messages import Messages
 from buildbot.db import buildrequests
 
 class Builder(config.ReconfigurableServiceMixin,
@@ -201,6 +202,7 @@ class Builder(config.ReconfigurableServiceMixin,
 
     def _attached(self, sb):
         self.builder_status.addPointEvent(['connect', sb.slave.slavename])
+        self.messages = Messages("Master", "Slave " + sb.slave.slavename)
         self.attaching_slaves.remove(sb)
         self.slaves.append(sb)
 
@@ -343,6 +345,7 @@ class Builder(config.ReconfigurableServiceMixin,
 
         # tell the remote that it's starting a build, too
         try:
+            self.messages.sendMessage("startBuild")
             yield slavebuilder.remote.callRemote("startBuild")
         except:
             log.err(failure.Failure(), 'while calling remote startBuild:')
@@ -725,7 +728,7 @@ class BuilderControl:
 
         properties_dict = dict((k,(v,s)) for (k,v,s) in properties.asList())
         ssList = bs.getSourceStamps(absolute=True)
-        
+
         if ssList:
             sourcestampsetid = yield  ssList[0].getSourceStampSetId(self.master.master)
             dl = []
@@ -736,8 +739,8 @@ class BuilderControl:
 
             bsid, brids = yield self.master.master.addBuildset(
                     builderNames=[self.original.name],
-                    sourcestampsetid=sourcestampsetid, 
-                    reason=reason, 
+                    sourcestampsetid=sourcestampsetid,
+                    reason=reason,
                     properties=properties_dict)
             defer.returnValue((bsid, brids))
         else:

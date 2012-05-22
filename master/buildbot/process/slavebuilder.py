@@ -17,6 +17,8 @@ from twisted.spread import pb
 from twisted.internet import defer
 from twisted.python import log
 
+from buildbot.messages import Messages
+
 (ATTACHING, # slave attached, still checking hostinfo/etc
  IDLE, # idle, available for use
  PINGING, # build about to start, making sure it is still alive
@@ -38,6 +40,7 @@ class AbstractSlaveBuilder(pb.Referenceable):
         self.slave = None
         self.builder_name = None
         self.locks = None
+        self.messages = Messages("Master", "SlaveBuilder")
 
     def __repr__(self):
         r = ["<", self.__class__.__name__]
@@ -107,7 +110,13 @@ class AbstractSlaveBuilder(pb.Referenceable):
             self.remote.callRemote("setMaster", self))
 
         d.addCallback(lambda _:
+            self.messages.sendMessage("setMaster - self"))
+
+        d.addCallback(lambda _:
             self.remote.callRemote("print", "attached"))
+
+        d.addCallback(lambda _:
+            self.messages.sendMessage("print : attached"))
 
         def setIdle(res):
             self.state = IDLE
@@ -142,6 +151,7 @@ class AbstractSlaveBuilder(pb.Referenceable):
                 # I think it will make the tests run smoother if the status
                 # is updated before the ping completes
             Ping().ping(self.remote).addCallback(self._pong)
+            self.messages.sendMessage("print ping")
 
         def reset_state(res):
             if self.state == PINGING:
@@ -292,6 +302,3 @@ class LatentSlaveBuilder(AbstractSlaveBuilder):
                 status.addEvent(["ping", "latent"]).finish()
             return defer.succeed(True)
         return AbstractSlaveBuilder.ping(self, status)
-
-
-

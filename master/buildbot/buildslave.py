@@ -31,7 +31,9 @@ from buildbot.interfaces import IBuildSlave, ILatentBuildSlave
 from buildbot.process.properties import Properties
 from buildbot.locks import LockAccess
 from buildbot.util import subscription
+from buildbot.messages import Messages
 from buildbot import config
+
 
 class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
                         service.MultiService):
@@ -111,6 +113,7 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
         self.detached_subs = None
 
         self._old_builder_list = None
+        self.messages = Messages("Master", "Slave " + name)
 
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self.slavename)
@@ -285,6 +288,7 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
         if not self.slave:
             return
         d = self.slave.callRemote("print", "Received keepalive from master")
+        self.messages.sendMessage("KeepAlive")
         d.addErrback(log.msg, "Keepalive failed for '%s'" % (self.slavename, ))
 
     def stopKeepaliveTimer(self):
@@ -372,12 +376,14 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
         d = defer.succeed(None)
         def _log_attachment_on_slave(res):
             d1 = bot.callRemote("print", "attached")
+            self.messages.sendMessage("print : \"Attached\" ")
             d1.addErrback(lambda why: None)
             return d1
         d.addCallback(_log_attachment_on_slave)
 
         def _get_info(res):
             d1 = bot.callRemote("getSlaveInfo")
+            self.messages.sendMessage("getSlaveInfo")
             def _got_info(info):
                 log.msg("Got slaveinfo from '%s'" % self.slavename)
                 # TODO: info{} might have other keys
@@ -399,6 +405,7 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
 
         def _get_version(res):
             d = bot.callRemote("getVersion")
+            self.messages.sendMessage("getVersion")
             def _got_version(version):
                 state["version"] = version
             def _version_unavailable(why):
@@ -411,6 +418,7 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
 
         def _get_commands(res):
             d1 = bot.callRemote("getCommands")
+            self.messages.sendMessage("getCommand")
             def _got_commands(commands):
                 state["slave_commands"] = commands
             def _commands_unavailable(why):
@@ -553,6 +561,7 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
             return defer.succeed(None)
 
         d = self.slave.callRemote("setBuilderList", blist)
+        self.messages.sendMessage("setBuilderlist - (Also pass blist)")
         def sentBuilderList(ign):
             self._old_builder_list = blist
             return ign
@@ -648,6 +657,7 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
         # failures.
         def new_way():
             d = self.slave.callRemote('shutdown')
+            self.messages.sendMessage('shutdown')
             d.addCallback(lambda _ : True) # successful shutdown request
             def check_nsm(f):
                 f.trap(pb.NoSuchMethod)
@@ -670,6 +680,7 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
             for b in self.slavebuilders.values():
                 if b.remote:
                     d = b.remote.callRemote("shutdown")
+                    self.messages.sendMessage("shutdown")
                     break
 
             if d:
@@ -933,7 +944,7 @@ class AbstractLatentBuildSlave(AbstractBuildSlave):
 
     def disconnect(self):
         # This returns a Deferred but we don't use it
-        self._soft_disconnect() 
+        self._soft_disconnect()
         # this removes the slave from all builders.  It won't come back
         # without a restart (or maybe a sighup)
         self.botmaster.slaveLost(self)

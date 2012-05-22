@@ -27,6 +27,7 @@ from twisted.cred import credentials
 import buildslave
 from buildslave.pbutil import ReconnectingPBClientFactory
 from buildslave.commands import registry, base
+from buildslave.messages import Messages
 from buildslave import monkeypatches
 
 class UnknownCommand(pb.Error):
@@ -57,6 +58,7 @@ class SlaveBuilder(pb.Referenceable, service.Service):
     def __init__(self, name):
         #service.Service.__init__(self) # Service has no __init__ method
         self.setName(name)
+        self.messages = Messages(name, "Master")
 
     def __repr__(self):
         return "<SlaveBuilder '%s' at %d>" % (self.name, id(self))
@@ -186,9 +188,9 @@ class SlaveBuilder(pb.Referenceable, service.Service):
             update = [data, 0]
             updates = [update]
             d = self.remoteStep.callRemote("update", updates)
+            self.messages.sendMessage("updates")
             d.addCallback(self.ackUpdate)
             d.addErrback(self._ackFailed, "SlaveBuilder.sendUpdate")
-
     def ackUpdate(self, acknum):
         self.activity() # update the "last activity" timer
 
@@ -219,6 +221,7 @@ class SlaveBuilder(pb.Referenceable, service.Service):
         if self.remoteStep:
             self.remoteStep.dontNotifyOnDisconnect(self.lostRemoteStep)
             d = self.remoteStep.callRemote("complete", failure)
+            self.messages.sendMessage("complete")
             d.addCallback(self.ackComplete)
             d.addErrback(self._ackFailed, "sendComplete")
             self.remoteStep = None
@@ -241,6 +244,7 @@ class Bot(pb.Referenceable, service.MultiService):
         self.usePTY = usePTY
         self.unicode_encoding = unicode_encoding or sys.getfilesystemencoding() or 'ascii'
         self.builders = {}
+        self.messages = Messages("Slave ", "Master")
 
     def startService(self):
         assert os.path.isdir(self.basedir)
@@ -251,6 +255,7 @@ class Bot(pb.Referenceable, service.MultiService):
             (n, base.command_version)
             for n in registry.getAllCommandNames()
         ])
+        self.messages.sendMessage("commands")
         return commands
 
     @defer.deferredGenerator
@@ -319,10 +324,12 @@ class Bot(pb.Referenceable, service.MultiService):
         files['environ'] = os.environ.copy()
         files['system'] = os.name
         files['basedir'] = self.basedir
+        self.messages.sendMessage("files - (Also pass files)")
         return files
 
     def remote_getVersion(self):
         """Send our version back to the Master"""
+        self.messages.sendMessage("buildslave.version")
         return buildslave.version
 
     def remote_shutdown(self):
@@ -354,14 +361,16 @@ class BotFactory(ReconnectingPBClientFactory):
     # for tests
     _reactor = reactor
 
-    def __init__(self, buildmaster_host, port, keepaliveInterval, maxDelay):
+    def __init__(self, buildmaster_host, port, keepaliveInterval, maxDelay, name):
         ReconnectingPBClientFactory.__init__(self)
         self.maxDelay = maxDelay
         self.keepaliveInterval = keepaliveInterval
         # NOTE: this class does not actually make the TCP connections - this information is
         # only here to print useful error messages
+        self.name = name
         self.buildmaster_host = buildmaster_host
         self.port = port
+        self.messages = Messages("Slave " + self.name, "master")
 
     def startedConnecting(self, connector):
         log.msg("Connecting to %s:%s" % (self.buildmaster_host, self.port))
@@ -413,7 +422,8 @@ class BotFactory(ReconnectingPBClientFactory):
             # was already dropped, so just log and ignore.
             log.msg("sending app-level keepalive")
             d = self.perspective.callRemote("keepalive")
-            d.addErrback(log.err, "eror sending keepalive")
+            self.messages.sendMessage("keepalive")
+            d.addErrback(log.err, "error sending keepalive")
         self.keepaliveTimer = self._reactor.callLater(self.keepaliveInterval,
                                                       doKeepalive)
 
@@ -448,7 +458,6 @@ class BuildSlave(service.MultiService):
             keepalive = None
         self.umask = umask
         self.basedir = basedir
-
         self.shutdown_loop = None
 
         if allow_shutdown == 'signal':
@@ -459,7 +468,7 @@ class BuildSlave(service.MultiService):
             self.shutdown_mtime = 0
 
         self.allow_shutdown = allow_shutdown
-        bf = self.bf = BotFactory(buildmaster_host, port, keepalive, maxdelay)
+        bf = self.bf = BotFactory(buildmaster_host, port, keepalive, maxdelay, name)
         bf.startLogin(credentials.UsernamePassword(name, passwd), client=bot)
         self.connection = c = internet.TCPClient(buildmaster_host, port, bf)
         c.setServiceParent(self)
@@ -533,9 +542,9 @@ class BuildSlave(service.MultiService):
             log.msg("No active connection, shutting down NOW")
             reactor.stop()
             return
-
         log.msg("Telling the master we want to shutdown after any running builds are finished")
         d = self.bf.perspective.callRemote("shutdown")
+        self.bf.messages.sendMessage("shutdown")
         def _shutdownfailed(err):
             if err.check(AttributeError):
                 log.msg("Master does not support slave initiated shutdown.  Upgrade master to 0.8.3 or later to use this feature.")

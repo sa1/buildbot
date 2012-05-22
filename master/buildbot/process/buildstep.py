@@ -29,6 +29,7 @@ from buildbot.status import progress
 from buildbot.status.results import SUCCESS, WARNINGS, FAILURE, SKIPPED, \
      EXCEPTION, RETRY, worst_status
 from buildbot.process import metrics, properties
+from buildbot.messages import Messages
 
 class BuildStepFailed(Exception):
     pass
@@ -142,7 +143,7 @@ class RemoteCommand(pb.Referenceable):
 
         # tell the remote command to halt. Returns a Deferred that will fire
         # when the interrupt command has been delivered.
-        
+
         d = defer.maybeDeferred(self.remote.callRemote, "interruptCommand",
                                 self.commandID, str(why))
         # the slave may not have remote_interruptCommand
@@ -614,10 +615,10 @@ class BuildStep(properties.PropertiesMixin):
         if self.progress:
             self.progress.finish()
         self.step_status.stepFinished(results)
-        
+
         hidden = self._maybeEvaluate(self.hideStepIf, results, self)
         self.step_status.setHidden(hidden)
-        
+
         self.releaseLocks()
         self.deferred.callback(results)
 
@@ -724,7 +725,7 @@ class BuildStep(properties.PropertiesMixin):
         c.buildslave = self.buildslave
         d = c.run(self, self.remote)
         return d
-    
+
     @staticmethod
     def _maybeEvaluate(value, *args, **kwargs):
         if callable(value):
@@ -932,4 +933,3 @@ def regex_log_evaluator(cmd, step_status, regexes):
 from buildbot.process.properties import WithProperties
 _hush_pyflakes = [WithProperties]
 del _hush_pyflakes
-
