@@ -31,6 +31,7 @@ from buildbot.interfaces import IBuildSlave, ILatentBuildSlave
 from buildbot.process.properties import Properties
 from buildbot.locks import LockAccess
 from buildbot.util import subscription
+from buildbot.slaveproto.pb import PBSlaveProto
 from buildbot import config
 
 class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
@@ -111,6 +112,8 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
         self.detached_subs = None
 
         self._old_builder_list = None
+
+        self.proto = PBSlaveProto(name, password, missing_timeout, keepalive_interval)
 
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self.slavename)
@@ -196,22 +199,13 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
         assert self.slavename == new.slavename
 
         # do we need to re-register?
-        if (not self.registration or
-            self.password != new.password or
-            new_config.slavePortnum != self.registered_port):
-            if self.registration:
-                self.registration.unregister()
-            self.password = new.password
-            self.registered_port = new_config.slavePortnum
-            self.registration = self.master.pbmanager.register(
-                    self.registered_port, self.slavename,
-                    self.password, self.getPerspective)
+        self.registration = self.proto.register(new, new_config, self.master)
+
 
         # adopt new instance's configuration parameters
         self.max_builds = new.max_builds
         self.access = new.access
         self.notify_on_missing = new.notify_on_missing
-        self.keepalive_interval = new.keepalive_interval
 
         if self.missing_timeout != new.missing_timeout:
             running_missing_timer = self.missing_timer
@@ -361,7 +355,7 @@ class AbstractBuildSlave(config.ReconfigurableServiceMixin, pb.Avatar,
         # Builders that care about it.
 
         # we accumulate slave information in this 'state' dictionary, then
-        # set it atomically if we make it far enough through the process
+        # set it automically if we make it far enough through the process
         state = {}
 
         # Reset graceful shutdown status
@@ -950,7 +944,7 @@ class AbstractLatentBuildSlave(AbstractBuildSlave):
 
     def disconnect(self):
         # This returns a Deferred but we don't use it
-        self._soft_disconnect() 
+        self._soft_disconnect()
         # this removes the slave from all builders.  It won't come back
         # without a restart (or maybe a sighup)
         self.botmaster.slaveLost(self)
