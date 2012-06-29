@@ -37,7 +37,9 @@ class PBSlaveProto(pb.Avatar):
         self.registration = None
         self.registered_port = None
 
-        self.bot = None # a RemoteReference to the Bot, when connected
+        self.bot = None
+        self.slave = None # a RemoteReference to the accepted Bot, when connected
+
         self.buildslave= buildslave# a local reference to BuildSlave
 
         self.missing_timeout = missing_timeout
@@ -49,7 +51,7 @@ class PBSlaveProto(pb.Avatar):
         """
         set BuilderList for a BuildSlave
         """
-        return self.bot.callRemote("setBuilderList", builders)
+        return self.slave.callRemote("setBuilderList", builders)
 
     def startBuild(self, builder, args):
         """
@@ -65,22 +67,16 @@ class PBSlaveProto(pb.Avatar):
         # This is not used at the moment.
         pass
 
-    def getSlaveInfo(self, res):
+    def getSlaveInfo(self):
         """
         send SlaveInfo to Master on request
         """
 
         # we accumulate slave information in this 'state' dictionary, then
-        # set it automically if we make it far enough through the process
+        # set it atomically if we make it far enough through the process
         state = {}
 
         d = defer.succeed(None)
-
-        def _log_attachment_on_slave(res):
-            d1 = self.bot.callRemote("print", "attached")
-            d1.addErrback(lambda why: None)
-            return d1
-        d.addCallback(_log_attachment_on_slave)
 
         def _get_info(res):
             d1 = self.bot.callRemote("getSlaveInfo")
@@ -144,32 +140,68 @@ class PBSlaveProto(pb.Avatar):
         """
         pass
 
+    @defer.inlineCallbacks
     def shutdown(self):
         """
         shutdown slave
         """
 
-        # This way of shutting down only applies to slaves newer than 0.8.3,
-        # old slaves would fall back to the old method in AbstractBuildSlave.
+        if not self.bot:
+            log.msg("no remote; slave is already shut down")
+            return
 
-        d = self.bot.callRemote('shutdown')
-        d.addCallback(lambda _ : True) # successful shutdown request
-        def check_nsm(f):
-            f.trap(pb.NoSuchMethod)
-            return False # fall through to the old way
-        d.addErrback(check_nsm)
-        def check_connlost(f):
-            f.trap(pb.PBConnectionLost)
-            return True # the slave is gone, so call it finished
-        d.addErrback(check_connlost)
-        return d
+        # First, try the "new" way - calling our own remote's shutdown
+        # method.  The method was only added in 0.8.3, so ignore NoSuchMethod
+        # failures.
 
-    def send_message(self, message):
+        def new_way():
+            d = self.slave.callRemote('shutdown')
+            d.addCallback(lambda _ : True) # successful shutdown request
+            def check_nsm(f):
+                f.trap(pb.NoSuchMethod)
+                return False # fall through to the old way
+            d.addErrback(check_nsm)
+            def check_connlost(f):
+                f.trap(pb.PBConnectionLost)
+                return True # the slave is gone, so call it finished
+            d.addErrback(check_connlost)
+            return d
+
+        if (yield new_way()):
+            return # done!
+
+        def old_way():
+            d = None
+            for b in self.slavebuilders.values():
+                if b.remote:
+                    d = b.remote.callRemote("shutdown")
+                    break
+
+            if d:
+                log.msg("Shutting down (old) slave: %s" % self.slavename)
+                # The remote shutdown call will not complete successfully since the
+                # buildbot process exits almost immediately after getting the
+                # shutdown request.
+                # Here we look at the reason why the remote call failed, and if
+                # it's because the connection was lost, that means the slave
+                # shutdown as expected.
+                def _errback(why):
+                    if why.check(pb.PBConnectionLost):
+                        log.msg("Lost connection to %s" % self.slavename)
+                    else:
+                        log.err("Unexpected error when trying to shutdown %s" % self.slavename)
+                d.addErrback(_errback)
+                return d
+            log.err("Couldn't find remote builder to shut down slave")
+            return defer.succeed(None)
+        yield old_way()
+
+
+    def sendMessage(self, message):
         """
         Sending a message to be printed to the slave. Also use for sending keepalives.
         """
         d = self.bot.callRemote("print", message)
-        d.addErrback(log.msg, "Sending a message failed for '%s'" % (self.slavename, ))
         return d
 
     def getPerspective(self, mind, slavename):
@@ -180,8 +212,7 @@ class PBSlaveProto(pb.Avatar):
         if self.buildslave.slave_status:
             self.buildslave.slave_status.recordConnectTime()
 
-
-        if self.buildslave.isConnected():
+        if self.isConnected():
             # duplicate slave - send it to arbitration
             arb = botmaster.DuplicateSlaveArbitrator(self)
             return arb.getPerspective(mind, slavename)
@@ -191,11 +222,63 @@ class PBSlaveProto(pb.Avatar):
 
     def attached(self, bot):
         self.bot = bot
-        return self.buildslave.attached(bot)
+
+        # Log attachment on slave
+        d = self.bot.callRemote("print", "attached")
+        d.addErrback(lambda why: None)
+        def _getSlaveInfo(res):
+            return self.getSlaveInfo()
+        d.addCallback(_getSlaveInfo)
+        d.addCallback(self.buildslave.attached)
+        return d
+
+    def acceptSlave(self):
+        self.slave = self.bot
 
     def detached(self, mind):
+        self.bot = self.slave = None
         self.buildslave.detached()
         self.stopKeepaliveTimer()
+
+    # TODO: Use SlaveStatus for this.
+    def isConnected(self):
+        return self.slave
+
+    def _disconnect(self):
+        # all kinds of teardown will happen as a result of
+        # loseConnection(), but it happens after a reactor iteration or
+        # two. Hook the actual disconnect so we can know when it is safe
+        # to connect the new slave. We have to wait one additional
+        # iteration (with callLater(0)) to make sure the *other*
+        # notifyOnDisconnect handlers have had a chance to run.
+        d = defer.Deferred()
+
+        # notifyOnDisconnect runs the callback with one argument, the
+        # RemoteReference being disconnected.
+        def _disconnected(rref):
+            reactor.callLater(0, d.callback, None)
+        self.slave.notifyOnDisconnect(_disconnected)
+        tport = self.slave.broker.transport
+        # this is the polite way to request that a socket be closed
+        tport.loseConnection()
+        try:
+            # but really we don't want to wait for the transmit queue to
+            # drain. The remote end is unlikely to ACK the data, so we'd
+            # probably have to wait for a (20-minute) TCP timeout.
+            #tport._closeSocket()
+            # however, doing _closeSocket (whether before or after
+            # loseConnection) somehow prevents the notifyOnDisconnect
+            # handlers from being run. Bummer.
+            tport.offset = 0
+            tport.dataBuffer = ""
+        except:
+            # however, these hacks are pretty internal, so don't blow up if
+            # they fail or are unavailable
+            log.msg("failed to accelerate the shutdown process")
+        log.msg("waiting for slave to finish disconnecting")
+
+        return d
+
 
     def perspective_keepalive(self):
         self.buildslave.messageReceivedFromSlave()
@@ -223,7 +306,7 @@ class PBSlaveProto(pb.Avatar):
                                                 self.doKeepalive)
         if not self.bot:
             return
-        d = self.send_message("Received keepalive from master")
+        d = self.sendMessage("Received keepalive from master")
         d.addErrback(log.msg, "Keepalive failed for '%s'" % (self.slavename, ))
 
     def stopKeepaliveTimer(self):
